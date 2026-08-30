@@ -3,6 +3,7 @@
 # Parse arguments for optional flags
 SINGLE_TRACK=""
 SUBDIR=""
+FETCH_LYRICS="1"
 POSITIONAL_ARGS=()
 
 while [ $# -gt 0 ]; do
@@ -14,6 +15,10 @@ while [ $# -gt 0 ]; do
     -d|--dir)
       SUBDIR="$2"
       shift 2
+      ;;
+    --no-lyrics)
+      FETCH_LYRICS=""
+      shift
       ;;
     *)
       POSITIONAL_ARGS+=("$1")
@@ -27,11 +32,13 @@ set -- "${POSITIONAL_ARGS[@]}"
 
 # Check if a URL was provided
 if [ -z "$1" ]; then
-  echo "Usage: $0 [--single|-s] [-d <subfolder>] <YouTube URL> [browser]"
+  echo "Usage: $0 [--single|-s] [-d <subfolder>] [--no-lyrics] <YouTube URL> [browser]"
+  echo ""
+  echo "Lyrics are fetched from lrclib.net by default. Pass --no-lyrics to skip."
   echo ""
   echo "Examples:"
   echo "  $0 'https://music.youtube.com/playlist?list=...' -d 'Albums/Kanye/BULLY'"
-  echo "  $0 -s 'https://music.youtube.com/watch?v=...' -d 'Liked'"
+  echo "  $0 -s 'https://music.youtube.com/watch?v=...' -d 'Liked' --no-lyrics"
   exit 1
 fi
 
@@ -158,6 +165,94 @@ ssh "${SSH_MUX_OPTS[@]}" "$REMOTE_SERVER" "mkdir -p '$FINAL_REMOTE_DIR'"
 # playlist — already-uploaded batches are safe either way.
 BATCH_SIZE=50
 
+# Looks up lyrics on lrclib.net (free, no API key) for one downloaded file,
+# using the title/artist/album tags already embedded on it, and writes a
+# sidecar .lrc file next to it with the same basename (e.g. Song_Artist.lrc
+# next to Song_Artist.m4a). Navidrome (0.63+) reads these directly as long
+# as LyricsPriority in its config includes ".lrc" — see the note printed at
+# the end of the script. Never fails the batch; a missed lookup just means
+# no lyrics for that one track.
+fetch_lyrics_for_file() {
+  local file="$1"
+  python3 - "$file" <<'PYEOF'
+import sys, subprocess, json, urllib.request, urllib.parse, os
+
+path = sys.argv[1]
+
+def ffprobe_tag(tag):
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", f"format_tags={tag}",
+             "-of", "default=noprint_wrapper=1:nokey=1", path],
+            capture_output=True, text=True, timeout=10
+        )
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+def ffprobe_duration():
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrapper=1:nokey=1", path],
+            capture_output=True, text=True, timeout=10
+        )
+        return int(float(out.stdout.strip()))
+    except Exception:
+        return None
+
+title = ffprobe_tag("title")
+artist = ffprobe_tag("artist")
+album = ffprobe_tag("album")
+duration = ffprobe_duration()
+
+if not title or not artist:
+    print(f"  Skipping lyrics for {os.path.basename(path)}: missing title/artist tag")
+    sys.exit(0)
+
+def fetch(url):
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "music-dl-script/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                return None
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+lyrics = None
+
+# Exact match first: most reliable when title/artist/album/duration all
+# line up with lrclib's database.
+params = {"track_name": title, "artist_name": artist}
+if album:
+    params["album_name"] = album
+if duration:
+    params["duration"] = str(duration)
+data = fetch("https://lrclib.net/api/get?" + urllib.parse.urlencode(params))
+if data and (data.get("syncedLyrics") or data.get("plainLyrics")):
+    lyrics = data.get("syncedLyrics") or data.get("plainLyrics")
+
+# Fuzzy fallback: helps when album is the constructed "Artist - Liked"
+# placeholder (no real album metadata) or duration is slightly off from
+# the official release.
+if not lyrics:
+    params = {"track_name": title, "artist_name": artist}
+    data = fetch("https://lrclib.net/api/search?" + urllib.parse.urlencode(params))
+    if isinstance(data, list) and data:
+        best = data[0]
+        lyrics = best.get("syncedLyrics") or best.get("plainLyrics")
+
+if lyrics:
+    lrc_path = os.path.splitext(path)[0] + ".lrc"
+    with open(lrc_path, "w", encoding="utf-8") as f:
+        f.write(lyrics)
+    print(f"  Lyrics found for {os.path.basename(path)}")
+else:
+    print(f"  No lyrics found for {os.path.basename(path)}")
+PYEOF
+}
+
 # Downloads one batch (optionally restricted to a --playlist-items range)
 # into its own staging dir, uploads it, then cleans up. Returns non-zero on
 # failure so the caller can track which batches need a retry.
@@ -190,8 +285,21 @@ download_and_upload_batch() {
     return 1
   fi
 
+  if [ -n "$FETCH_LYRICS" ]; then
+    echo "Fetching lyrics..."
+    for f in "$batch_dir"/*.m4a; do
+      fetch_lyrics_for_file "$f"
+    done
+  fi
+
   echo "Uploading batch to $FINAL_REMOTE_DIR..."
-  if scp -o ControlPath="$SSH_CONTROL_PATH" "$batch_dir"/*.m4a "$REMOTE_SERVER:$FINAL_REMOTE_DIR/"; then
+  # nullglob so *.lrc simply contributes nothing if lyrics were skipped/not
+  # found for every track in this batch, instead of scp erroring on a
+  # literal unmatched glob.
+  shopt -s nullglob
+  local upload_files=("$batch_dir"/*.m4a "$batch_dir"/*.lrc)
+  shopt -u nullglob
+  if scp -o ControlPath="$SSH_CONTROL_PATH" "${upload_files[@]}" "$REMOTE_SERVER:$FINAL_REMOTE_DIR/"; then
     rm -rf "$batch_dir"
     return 0
   else
@@ -229,6 +337,14 @@ else
       BATCH_NUM=$((BATCH_NUM + 1))
     done
   fi
+fi
+
+if [ -n "$FETCH_LYRICS" ]; then
+  echo ""
+  echo "Note: for Navidrome to actually display these .lrc files, your"
+  echo "docker-compose.yml needs LyricsPriority set to include .lrc, e.g.:"
+  echo "  ND_LYRICSPRIORITY: .lrc,embedded"
+  echo "(Navidrome only checks embedded tags by default.)"
 fi
 
 echo ""
