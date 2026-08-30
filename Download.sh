@@ -140,6 +140,15 @@ if [ -n "$ALBUM_MODE" ]; then
   # (-d "Playlists/...") where the whole download really is one thing.
   LIKED_FALLBACK_ARGS=()
   ALBUM_PARSE="%(playlist_title,title)s:%(album)s"
+  # YouTube Music auto-generates playlist titles like "Album - BULLY -
+  # DELUXE" for whole-album playlists — that "Album - " prefix is literal
+  # text in the source playlist's own title, not something this script
+  # adds. Strip it so the embedded album name matches how a normal album
+  # (e.g. "Graduation", "Voodoo") looks, instead of "Album - Voodoo".
+  # --replace-in-metadata runs in the same ordered pipeline as
+  # --parse-metadata, so placing it after ALBUM_PARSE in the yt-dlp
+  # invocation below means it operates on the album value we just set.
+  REPLACE_ARGS=(--replace-in-metadata "album" "(?i)^album\s*-\s*" "")
   # Source album_artist from the playlist's owning channel, not the
   # per-track artist field — per-track artist varies with features
   # (e.g. "Kanye West, Ye" vs "Kanye West, Ye, Travis Scott"), and since
@@ -186,6 +195,10 @@ else
   # --parse-metadata options apply in the order given, and step 2 needs
   # this field to already exist.
   LIKED_FALLBACK_ARGS=(--parse-metadata '%(artist,uploader,channel)s - Liked:%(meta_liked_fallback)s')
+  # No prefix-stripping needed here — album comes from each track's own
+  # real album metadata (or the Liked fallback), never from a playlist
+  # title, so there's no "Album - " prefix to strip.
+  REPLACE_ARGS=()
   # Step 2: real album wins if present, else the fallback computed above.
   ALBUM_PARSE='%(album,meta_liked_fallback)s:%(album)s'
   # Same idea for album_artist: real value first, else per-track
@@ -505,6 +518,7 @@ download_and_upload_batch() {
     "${LIKED_FALLBACK_ARGS[@]}" \
     --parse-metadata "$ALBUM_ARTIST_PARSE" \
     --parse-metadata "$ALBUM_PARSE" \
+    "${REPLACE_ARGS[@]}" \
     --parse-metadata '%(track_number,playlist_index)s:%(track_number)s' \
     "${DATE_ARGS[@]}" \
     -o "$batch_dir/$OUTPUT_TEMPLATE" \
