@@ -6,7 +6,6 @@ SUBDIR=""
 FETCH_LYRICS="1"
 BATCH_SIZE_ARG=""
 ALBUM_MODE=""
-ENRICH_ALBUM="1"
 POSITIONAL_ARGS=()
 
 while [ $# -gt 0 ]; do
@@ -31,10 +30,6 @@ while [ $# -gt 0 ]; do
       ALBUM_MODE="1"
       shift
       ;;
-    --no-enrich)
-      ENRICH_ALBUM=""
-      shift
-      ;;
     *)
       POSITIONAL_ARGS+=("$1")
       shift
@@ -47,19 +42,15 @@ set -- "${POSITIONAL_ARGS[@]}"
 
 # Check if a URL was provided
 if [ -z "$1" ]; then
-  echo "Usage: $0 [--single|-s] [--album] [-d <subfolder>] [--no-lyrics] [--no-enrich] [--batch <N>] <YouTube URL> [browser]"
+  echo "Usage: $0 [--single|-s] [--album] [-d <subfolder>] [--no-lyrics] [--batch <N>] <YouTube URL> [browser]"
   echo ""
   echo "Default (no flag): tags each track with ITS OWN real album/artist/date"
-  echo "  (falling back to a constructed 'Artist - Liked' name only when a"
-  echo "  track has no real album info), while still batching through the"
-  echo "  whole playlist. Use this for things like your YouTube 'Liked Music'"
-  echo "  playlist, where every track belongs to a different real album."
-  echo ""
-  echo "  When a track falls back (e.g. regular music videos don't carry"
-  echo "  YouTube's structured album metadata the way 'Artist - Topic'"
-  echo "  audio uploads do), the script looks up the real album via the"
-  echo "  iTunes Search API and uses that instead if it finds a confident"
-  echo "  match. Pass --no-enrich to skip this and keep the fallback name."
+  echo "  (falling back to the destination directory's name as the album,"
+  echo "  with album_artist 'Various Artists', only when a track has no real"
+  echo "  album info), while still batching through the whole playlist. Use"
+  echo "  this for things like your YouTube 'Liked Music' playlist or a"
+  echo "  themed mix (-d 'Playlists/Hits2000s'), where songs may belong to"
+  echo "  many different real albums, or none at all."
   echo ""
   echo "--album: treat the ENTIRE download as one album, named after the"
   echo "  playlist/album title, with one consistent release year and"
@@ -191,13 +182,14 @@ PYEOF
 
 # Determine album tagging based on mode:
 #  - --single (SINGLE_TRACK) or plain default: tag each track with
-#    ITS OWN real album/artist/date, falling back to a constructed
-#    "Artist - Liked" pseudo-album only when a track truly has none.
-#    --single additionally restricts the download to exactly one item;
-#    the plain default does not — it still batches through an entire
-#    playlist (e.g. your YouTube "Liked Music" playlist), it just tags
-#    each song individually instead of grouping everything under one
-#    album named after the playlist.
+#    ITS OWN real album/artist/date, falling back to the destination
+#    directory's name as the album (album_artist "Various Artists") only
+#    when a track truly has none. --single additionally restricts the
+#    download to exactly one item; the plain default does not — it still
+#    batches through an entire playlist (e.g. your YouTube "Liked Music"
+#    playlist, or a themed mix), it just tags each song individually
+#    instead of grouping everything under one album named after the
+#    playlist.
 #  - --album (-d "Albums/..." or "Playlists/..." use case): treat the
 #    whole download as one conceptual album named after the
 #    playlist/album title.
@@ -276,33 +268,51 @@ else
   # Default behavior, and always used for --single. Many official
   # YouTube/YT Music uploads (e.g. "Artist - Topic" channels) already
   # carry real album/album_artist/release_year metadata that yt-dlp
-  # extracts natively. Previous versions of this script unconditionally
-  # overwrote %(album)s with a constructed "Artist - Liked" name, clobbering
-  # that real metadata (e.g. showing "Kanye West - Liked" instead of the
-  # track's actual album "Graduation"). Now we prefer the real value and
-  # only fall back to the constructed name when the video truly has none
-  # (e.g. a remix/edit with no official album).
+  # extracts natively. We prefer that real value, and only fall back to a
+  # constructed name when the video truly has none (e.g. a regular music
+  # video, which doesn't carry YouTube's structured album metadata block
+  # the way "Artist - Topic" audio uploads do).
   #
-  # Step 1: compute the fallback name into a custom field first, since
-  # --parse-metadata options apply in the order given, and step 2 needs
-  # this field to already exist.
-  LIKED_FALLBACK_ARGS=(--parse-metadata '%(artist,uploader,channel)s - Liked:%(meta_liked_fallback)s')
+  # The fallback name is the destination directory itself (e.g. "-d
+  # 'Playlists/Hits2000s'" falls back to "Hits2000s"), shared by every
+  # track that lands there without real album info — this treats the
+  # folder as the compilation/mixtape it actually is. album_artist for
+  # those same fallback tracks is forced to "Various Artists" rather than
+  # each track's own real performer, since a directory-named compilation
+  # spans many different artists and needs one consistent album_artist to
+  # stay merged as a single Navidrome album.
+  if [ -n "$SUBDIR" ]; then
+    FALLBACK_ALBUM_NAME=$(basename "$SUBDIR")
+  else
+    FALLBACK_ALBUM_NAME="Liked"
+  fi
+  # Step 1: compute the fallback name/artist into custom fields first,
+  # since --parse-metadata options apply in the order given, and step 2
+  # needs these fields to already exist. These are literals (not
+  # per-track templates), and yt-dlp's --parse-metadata splits "FROM:TO"
+  # on the first unescaped colon, so any colon in the directory name
+  # needs escaping.
+  LIKED_FALLBACK_ARGS=(
+    --parse-metadata "${FALLBACK_ALBUM_NAME//:/\\:}:%(meta_liked_fallback)s"
+    --parse-metadata "Various Artists:%(meta_liked_fallback_artist)s"
+  )
   # No prefix-stripping needed here — album comes from each track's own
-  # real album metadata (or the Liked fallback), never from a playlist
-  # title, so there's no "Album - " prefix to strip.
+  # real album metadata (or the directory-name fallback), never from a
+  # playlist title, so there's no "Album - " prefix to strip.
   REPLACE_ARGS=()
   # Step 2: real album wins if present, else the fallback computed above.
   ALBUM_PARSE='%(album,meta_liked_fallback)s:%(album)s'
-  # Same idea for album_artist: real value first, else per-track
-  # artist/uploader/channel (no playlist_uploader — every track keeps its
-  # own album here, so there's no single "whole playlist" artist to pin to).
-  ALBUM_ARTIST_PARSE="%(album_artist,artist,uploader,channel)s:%(album_artist)s"
+  # Same idea for album_artist: real value wins if present, else the
+  # "Various Artists" literal computed above (not each track's own
+  # artist/uploader/channel — that would refracture the shared fallback
+  # album right back into one-album-per-performer).
+  ALBUM_ARTIST_PARSE='%(album_artist,meta_liked_fallback_artist)s:%(album_artist)s'
   # Only embed a real release_year (present when real album metadata was
   # found) — deliberately no upload_date fallback here. Tracks with a real
   # album get their real, correct, consistent release date. Tracks that
-  # fell back to the constructed "Artist - Liked" pseudo-album get no date
-  # at all (rather than each getting its own differing upload year), so
-  # they still all group together consistently, avoiding the original
+  # fell back to the directory-name pseudo-album get no date at all
+  # (rather than each getting its own differing upload year), so they
+  # still all group together consistently, avoiding the original
   # per-year album-fragmentation bug.
   #
   # IMPORTANT: yt-dlp's embed-metadata postprocessor hardcodes the muxed
@@ -432,114 +442,6 @@ reconcile_album_metadata_for_file() {
     fi
   fi
 }
-
-# Regular YouTube music videos (VEVO/label uploads) don't carry the
-# structured Album/Artist/Release metadata block that official
-# "Artist - Topic" audio-only uploads do — that block is where yt-dlp's
-# native %(album)s comes from. Mix/radio playlists in particular tend to
-# pull from these regular music videos, so EVERY track falls back to the
-# constructed "Artist - Liked" pseudo-album, even though each song does
-# have a real album in reality — YouTube just isn't the source for it.
-#
-# This looks up the real album via the iTunes Search API (free, no key)
-# whenever a track fell back, using the title/artist already embedded on
-# the file. If it finds a confident match, it remuxes the file with the
-# real album/album_artist/date instead of leaving the fallback in place.
-enrich_album_metadata_for_file() {
-  local file="$1"
-  python3 - "$file" <<'PYEOF'
-import sys, subprocess, json, urllib.request, urllib.parse, os
-
-path = sys.argv[1]
-
-def ffprobe_tag(tag):
-    try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", f"format_tags={tag}",
-             "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, timeout=10
-        )
-        return out.stdout.strip()
-    except Exception:
-        return ""
-
-title = ffprobe_tag("title")
-artist = ffprobe_tag("artist")
-album = ffprobe_tag("album")
-
-if not title or not artist:
-    sys.exit(0)
-
-# Only enrich tracks that actually hit the constructed fallback — leave
-# genuinely real albums (from YouTube or an earlier enrichment) alone.
-expected_fallback = f"{artist} - Liked"
-if album.strip() != expected_fallback.strip():
-    sys.exit(0)
-
-def fetch(url):
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "music-dl-script/1.0 (personal use)"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            if resp.status != 200:
-                print(f"  iTunes lookup HTTP {resp.status}")
-                return None
-            return json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        print(f"  iTunes lookup failed: {type(e).__name__}: {e}")
-        return None
-
-query = urllib.parse.urlencode({
-    "term": f"{artist} {title}",
-    "media": "music",
-    "entity": "song",
-    "limit": 5,
-})
-data = fetch("https://itunes.apple.com/search?" + query)
-results = (data or {}).get("results", [])
-
-# Simple confidence check: only trust a result if the artist name is a
-# loose match in either direction (case-insensitive substring), since
-# iTunes' search can return unrelated songs for an ambiguous query.
-best = None
-artist_lower = artist.lower()
-for r in results:
-    r_artist = (r.get("artistName") or "").lower()
-    if not r_artist:
-        continue
-    if artist_lower in r_artist or r_artist in artist_lower:
-        best = r
-        break
-
-if not best or not best.get("collectionName"):
-    print(f"  No confident real-album match for {os.path.basename(path)}, keeping fallback")
-    sys.exit(0)
-
-real_album = best["collectionName"]
-real_album_artist = best.get("artistName") or artist
-real_year = ""
-release_date = best.get("releaseDate") or ""
-if len(release_date) >= 4 and release_date[:4].isdigit():
-    real_year = release_date[:4]
-
-tmp_path = path + ".enrichtmp.m4a"
-cmd = ["ffmpeg", "-y", "-i", path, "-c", "copy",
-       "-metadata", f"album={real_album}",
-       "-metadata", f"album_artist={real_album_artist}"]
-if real_year:
-    cmd += ["-metadata", f"date={real_year}"]
-cmd.append(tmp_path)
-
-embed = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-if embed.returncode == 0 and os.path.exists(tmp_path):
-    os.replace(tmp_path, path)
-    print(f"  Enriched {os.path.basename(path)}: '{album}' -> real album '{real_album}' ({real_year or 'no year'})")
-else:
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
-    print(f"  Warning: found real album '{real_album}' but failed to embed it: {embed.stderr.strip()[-300:]}")
-PYEOF
-}
-
 # Looks up lyrics on lrclib.net (free, no API key) for one downloaded file,
 # using the title/artist/album tags already embedded on it, and writes a
 # sidecar .lrc file next to it with the same basename (e.g. Song_Artist.lrc
@@ -729,17 +631,10 @@ download_and_upload_batch() {
     return 1
   fi
 
-  # Only relevant in default/per-track mode — --album mode never uses the
-  # "Artist - Liked" fallback in the first place, so there's nothing to
-  # enrich or reconcile.
+  # Only relevant in default/per-track mode — --album mode already
+  # guarantees consistency by construction, so there's nothing to
+  # reconcile.
   if [ -z "$ALBUM_MODE" ]; then
-    if [ -n "$ENRICH_ALBUM" ]; then
-      echo "Checking for real album data on fallback tracks..."
-      for f in "$batch_dir"/*.m4a; do
-        enrich_album_metadata_for_file "$f"
-      done
-    fi
-
     for f in "$batch_dir"/*.m4a; do
       reconcile_album_metadata_for_file "$f"
     done
