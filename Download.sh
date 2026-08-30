@@ -72,6 +72,11 @@ fi
 # Determine album tagging based on mode (Single/Liked track vs Full Album/Playlist)
 if [ -n "$SINGLE_TRACK" ]; then
   ALBUM_PARSE="%(artist,uploader,channel)s - Liked:%(album)s"
+  # album_artist must be sourced the SAME way as the album name above
+  # (artist,uploader,channel), not playlist_uploader — a single Liked track
+  # has no playlist_uploader anyway, but keeping this explicit and matched
+  # to ALBUM_PARSE is what keeps grouping self-consistent for this mode.
+  ALBUM_ARTIST_PARSE="%(artist,uploader,channel)s:%(album_artist)s"
   # Don't embed a per-track release year here. Navidrome's default album
   # grouping (PID.Album) falls back to artist+album+releasedate when there's
   # no MusicBrainz ID, so if every "Liked" track carries its own real upload
@@ -79,13 +84,27 @@ if [ -n "$SINGLE_TRACK" ]; then
   # a separate album per year. Leaving date/year unset keeps it consistent
   # (empty) across all Liked tracks so they group into one album.
   DATE_ARGS=()
+  # Safety net: some YouTube Music "share this song" links resolve to a bare
+  # playlist/album URL with no video id, in which case --no-playlist has
+  # nothing to cut down to and yt-dlp downloads the whole thing. Force a
+  # hard cap to the first item whenever --single is used, regardless of
+  # what kind of URL it turns out to be.
+  SINGLE_ITEM_ARGS=(--playlist-items 1)
 else
   # Covers both full albums (-d "Albums/...") and playlists (-d "Playlists/...").
   ALBUM_PARSE="%(playlist_title,title)s:%(album)s"
+  # Source album_artist from the playlist's owning channel, not the
+  # per-track artist field — per-track artist varies with features
+  # (e.g. "Kanye West, Ye" vs "Kanye West, Ye, Travis Scott"), and since
+  # Navidrome groups albums by album_artist, letting it vary fractures one
+  # album into several. playlist_uploader stays identical for every track
+  # in the playlist/album, so grouping stays intact.
+  ALBUM_ARTIST_PARSE="%(playlist_uploader,uploader,channel)s:%(album_artist)s"
   DATE_ARGS=(
     --parse-metadata '%(release_year,upload_date>%Y)s:%(date)s'
     --parse-metadata '%(release_year,upload_date>%Y)s:%(year)s'
   )
+  SINGLE_ITEM_ARGS=()
 fi
 
 # Human-readable filename for every mode (single, album, or playlist).
@@ -133,12 +152,13 @@ download_and_upload_batch() {
     -x \
     -f 'ba[ext=m4a]' \
     $SINGLE_TRACK \
+    "${SINGLE_ITEM_ARGS[@]}" \
     "${range_args[@]}" \
     "${COOKIE_ARGS[@]}" \
     --embed-metadata \
     --embed-thumbnail \
     --parse-metadata '%(artist,uploader,channel)s:%(artist)s' \
-    --parse-metadata '%(playlist_uploader,uploader,channel)s:%(album_artist)s' \
+    --parse-metadata "$ALBUM_ARTIST_PARSE" \
     --parse-metadata "$ALBUM_PARSE" \
     --parse-metadata '%(track_number,playlist_index)s:%(track_number)s' \
     "${DATE_ARGS[@]}" \
