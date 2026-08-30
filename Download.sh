@@ -5,6 +5,7 @@ SINGLE_TRACK=""
 SUBDIR=""
 FETCH_LYRICS="1"
 BATCH_SIZE_ARG=""
+ALBUM_MODE=""
 POSITIONAL_ARGS=()
 
 while [ $# -gt 0 ]; do
@@ -25,6 +26,10 @@ while [ $# -gt 0 ]; do
       BATCH_SIZE_ARG="$2"
       shift 2
       ;;
+    --album)
+      ALBUM_MODE="1"
+      shift
+      ;;
     *)
       POSITIONAL_ARGS+=("$1")
       shift
@@ -37,15 +42,32 @@ set -- "${POSITIONAL_ARGS[@]}"
 
 # Check if a URL was provided
 if [ -z "$1" ]; then
-  echo "Usage: $0 [--single|-s] [-d <subfolder>] [--no-lyrics] [--batch <N>] <YouTube URL> [browser]"
+  echo "Usage: $0 [--single|-s] [--album] [-d <subfolder>] [--no-lyrics] [--batch <N>] <YouTube URL> [browser]"
+  echo ""
+  echo "Default (no flag): tags each track with ITS OWN real album/artist/date"
+  echo "  (falling back to a constructed 'Artist - Liked' name only when a"
+  echo "  track has no real album info), while still batching through the"
+  echo "  whole playlist. Use this for things like your YouTube 'Liked Music'"
+  echo "  playlist, where every track belongs to a different real album."
+  echo ""
+  echo "--album: treat the ENTIRE download as one album, named after the"
+  echo "  playlist/album title, with one consistent release year and"
+  echo "  album_artist across every track. Use this for an actual album or"
+  echo "  curated playlist download (-d 'Albums/...' or 'Playlists/...')."
+  echo ""
+  echo "--single|-s: same per-track tagging as the default, but restricts the"
+  echo "  download to exactly one item, even if the URL resolves to a"
+  echo "  playlist/album."
   echo ""
   echo "Lyrics are fetched from lrclib.net by default. Pass --no-lyrics to skip."
   echo "Playlists/albums download in batches of 50 by default. Pass --batch <N> to change."
   echo ""
   echo "Examples:"
-  echo "  $0 'https://music.youtube.com/playlist?list=...' -d 'Albums/Kanye/BULLY'"
+  echo "  $0 --album 'https://music.youtube.com/playlist?list=...' -d 'Albums/Kanye/BULLY'"
   echo "  $0 -s 'https://music.youtube.com/watch?v=...' -d 'Liked' --no-lyrics"
-  echo "  $0 'https://music.youtube.com/playlist?list=...' -d 'Playlists/RnB' --batch 20"
+  echo "  $0 --album 'https://music.youtube.com/playlist?list=...' -d 'Playlists/RnB' --batch 20"
+  echo "  $0 'https://music.youtube.com/playlist?list=LIKED_ID' -d 'Liked'"
+  echo "  $0 --liked 'https://music.youtube.com/playlist?list=LIKED_ID' -d 'Liked'"
   exit 1
 fi
 
@@ -101,53 +123,21 @@ else
   echo "Tip: for large playlists, export a frozen cookies.txt to $COOKIES_FILE to avoid mid-download cookie rotation errors."
 fi
 
-# Determine album tagging based on mode (Single/Liked track vs Full Album/Playlist)
-if [ -n "$SINGLE_TRACK" ]; then
-  # Many official YouTube/YT Music uploads (e.g. "Artist - Topic" channels)
-  # already carry real album/album_artist/release_year metadata that yt-dlp
-  # extracts natively. Previous versions of this script unconditionally
-  # overwrote %(album)s with a constructed "Artist - Liked" name, clobbering
-  # that real metadata (e.g. showing "Kanye West - Liked" instead of the
-  # track's actual album "Graduation"). Now we prefer the real value and
-  # only fall back to the constructed name when the video truly has none
-  # (e.g. a remix/edit with no official album).
-  #
-  # Step 1: compute the fallback name into a custom field first, since
-  # --parse-metadata options apply in the order given, and step 2 needs
-  # this field to already exist.
-  LIKED_FALLBACK_ARGS=(--parse-metadata '%(artist,uploader,channel)s - Liked:%(meta_liked_fallback)s')
-  # Step 2: real album wins if present, else the fallback computed above.
-  ALBUM_PARSE='%(album,meta_liked_fallback)s:%(album)s'
-  # Same idea for album_artist: real value first, else per-track
-  # artist/uploader/channel (no playlist_uploader — a true single has no
-  # playlist context).
-  ALBUM_ARTIST_PARSE="%(album_artist,artist,uploader,channel)s:%(album_artist)s"
-  # Only embed a real release_year (present when real album metadata was
-  # found) — deliberately no upload_date fallback here. Tracks with a real
-  # album get their real, correct, consistent release date. Tracks that
-  # fell back to the constructed "Artist - Liked" pseudo-album get no date
-  # at all (rather than each getting its own differing upload year), so
-  # they still all group together consistently, avoiding the original
-  # per-year album-fragmentation bug.
-  #
-  # IMPORTANT: yt-dlp's embed-metadata postprocessor hardcodes the muxed
-  # "date" tag to always come from info_dict['upload_date']
-  # (ffmpeg.py: add('date', 'upload_date')) — it completely ignores a
-  # plain %(date)s field set via --parse-metadata. The only way to
-  # actually override the embedded tag is yt-dlp's "meta_<field>" escape
-  # hatch, which bypasses that hardcoded mapping. So this must target
-  # %(meta_date)s, not %(date)s — targeting %(date)s silently no-ops.
-  DATE_ARGS=(
-    --parse-metadata '%(release_year|)s:%(meta_date)s'
-  )
-  # Safety net: some YouTube Music "share this song" links resolve to a bare
-  # playlist/album URL with no video id, in which case --no-playlist has
-  # nothing to cut down to and yt-dlp downloads the whole thing. Force a
-  # hard cap to the first item whenever --single is used, regardless of
-  # what kind of URL it turns out to be.
-  SINGLE_ITEM_ARGS=(--playlist-items 1)
-else
-  # Covers both full albums (-d "Albums/...") and playlists (-d "Playlists/...").
+# Determine album tagging based on mode:
+#  - --single (SINGLE_TRACK) or --liked (LIKED_MODE): tag each track with
+#    ITS OWN real album/artist/date, falling back to a constructed
+#    "Artist - Liked" pseudo-album only when a track truly has none.
+#    --single additionally restricts the download to exactly one item;
+#    the plain default does not — it still batches through an entire
+#    playlist (e.g. your YouTube "Liked Music" playlist), it just tags
+#    each song individually instead of grouping everything under one
+#    album named after the playlist.
+#  - --album (-d "Albums/..." or "Playlists/..." use case): treat the
+#    whole download as one conceptual album named after the
+#    playlist/album title.
+if [ -n "$ALBUM_MODE" ]; then
+  # Covers full albums (-d "Albums/...") and curated playlists
+  # (-d "Playlists/...") where the whole download really is one thing.
   LIKED_FALLBACK_ARGS=()
   ALBUM_PARSE="%(playlist_title,title)s:%(album)s"
   # Source album_artist from the playlist's owning channel, not the
@@ -172,7 +162,7 @@ else
     echo "Could not determine a release year — tracks will be embedded without one."
     ALBUM_YEAR=""
   fi
-  # See the long comment above on meta_date — %(date)s alone is a no-op,
+  # See the long comment below on meta_date — %(date)s alone is a no-op,
   # since yt-dlp always embeds upload_date for that tag unless overridden
   # via the meta_ prefix. The FROM side here is a literal (not a
   # per-track field reference), which is what makes it identical across
@@ -181,6 +171,56 @@ else
     --parse-metadata "${ALBUM_YEAR}:%(meta_date)s"
   )
   SINGLE_ITEM_ARGS=()
+else
+  # Default behavior, and always used for --single. Many official
+  # YouTube/YT Music uploads (e.g. "Artist - Topic" channels) already
+  # carry real album/album_artist/release_year metadata that yt-dlp
+  # extracts natively. Previous versions of this script unconditionally
+  # overwrote %(album)s with a constructed "Artist - Liked" name, clobbering
+  # that real metadata (e.g. showing "Kanye West - Liked" instead of the
+  # track's actual album "Graduation"). Now we prefer the real value and
+  # only fall back to the constructed name when the video truly has none
+  # (e.g. a remix/edit with no official album).
+  #
+  # Step 1: compute the fallback name into a custom field first, since
+  # --parse-metadata options apply in the order given, and step 2 needs
+  # this field to already exist.
+  LIKED_FALLBACK_ARGS=(--parse-metadata '%(artist,uploader,channel)s - Liked:%(meta_liked_fallback)s')
+  # Step 2: real album wins if present, else the fallback computed above.
+  ALBUM_PARSE='%(album,meta_liked_fallback)s:%(album)s'
+  # Same idea for album_artist: real value first, else per-track
+  # artist/uploader/channel (no playlist_uploader — every track keeps its
+  # own album here, so there's no single "whole playlist" artist to pin to).
+  ALBUM_ARTIST_PARSE="%(album_artist,artist,uploader,channel)s:%(album_artist)s"
+  # Only embed a real release_year (present when real album metadata was
+  # found) — deliberately no upload_date fallback here. Tracks with a real
+  # album get their real, correct, consistent release date. Tracks that
+  # fell back to the constructed "Artist - Liked" pseudo-album get no date
+  # at all (rather than each getting its own differing upload year), so
+  # they still all group together consistently, avoiding the original
+  # per-year album-fragmentation bug.
+  #
+  # IMPORTANT: yt-dlp's embed-metadata postprocessor hardcodes the muxed
+  # "date" tag to always come from info_dict['upload_date']
+  # (ffmpeg.py: add('date', 'upload_date')) — it completely ignores a
+  # plain %(date)s field set via --parse-metadata. The only way to
+  # actually override the embedded tag is yt-dlp's "meta_<field>" escape
+  # hatch, which bypasses that hardcoded mapping. So this must target
+  # %(meta_date)s, not %(date)s — targeting %(date)s silently no-ops.
+  DATE_ARGS=(
+    --parse-metadata '%(release_year|)s:%(meta_date)s'
+  )
+  # Safety net: some YouTube Music "share this song" links resolve to a bare
+  # playlist/album URL with no video id, in which case --no-playlist has
+  # nothing to cut down to and yt-dlp downloads the whole thing. Force a
+  # hard cap to the first item whenever --single is used, regardless of
+  # what kind of URL it turns out to be. Plain default (no --single)
+  # deliberately skips this — it's meant to walk a whole playlist.
+  if [ -n "$SINGLE_TRACK" ]; then
+    SINGLE_ITEM_ARGS=(--playlist-items 1)
+  else
+    SINGLE_ITEM_ARGS=()
+  fi
 fi
 
 # Human-readable filename for every mode (single, album, or playlist).
