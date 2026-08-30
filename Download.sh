@@ -260,6 +260,74 @@ if [ -n "$BATCH_SIZE_ARG" ]; then
   BATCH_SIZE="$BATCH_SIZE_ARG"
 fi
 
+# Per-album metadata reconciliation (default/per-track mode only — see
+# below). In default mode, each track independently decides its own
+# album/album_artist/date from its own video's metadata. Two songs that
+# genuinely belong to the same real album (e.g. two Voodoo tracks liked
+# separately) can still end up with slightly different album_artist or
+# date if their source videos differ even slightly (a feature credit, a
+# reissue date) — and since Navidrome groups by album+album_artist+date,
+# that one differing field splits one album into two even though the
+# album name text matches exactly.
+#
+# Fix: track a canonical (album_artist, date) per album name as tracks
+# are processed, globally across the whole run (all batches). The first
+# track seen for a given album establishes the canonical values; every
+# later track — whether later in the same batch or in a later batch —
+# gets forced to match via an ffmpeg remux if it differs. These arrays
+# are declared at top level (not "local") so they persist across every
+# call to download_and_upload_batch for the whole script run.
+#
+# Caveat: this only guarantees consistency within a single run of this
+# script. If you download more Liked songs from the same real album in a
+# later, separate run, there's no memory of what was chosen last time,
+# so a mismatch is still possible — use --album for a real
+# album/playlist you already know is one thing, which sidesteps this
+# entirely by forcing one literal value up front instead of reconciling
+# after the fact.
+declare -A ALBUM_ARTIST_MAP
+declare -A ALBUM_DATE_MAP
+
+reconcile_album_metadata_for_file() {
+  local file="$1"
+  local album album_artist date_tag
+  album=$(ffprobe -v error -show_entries format_tags=album -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
+  album_artist=$(ffprobe -v error -show_entries format_tags=album_artist -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
+  date_tag=$(ffprobe -v error -show_entries format_tags=date -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
+
+  # Nothing to key reconciliation on if there's no album name at all.
+  [ -z "$album" ] && return 0
+
+  local target_artist="$album_artist"
+  local target_date="$date_tag"
+  local needs_fix=0
+
+  if [ -n "${ALBUM_ARTIST_MAP[$album]+_}" ]; then
+    target_artist="${ALBUM_ARTIST_MAP[$album]}"
+    [ "$target_artist" != "$album_artist" ] && needs_fix=1
+  else
+    ALBUM_ARTIST_MAP["$album"]="$album_artist"
+  fi
+
+  if [ -n "${ALBUM_DATE_MAP[$album]+_}" ]; then
+    target_date="${ALBUM_DATE_MAP[$album]}"
+    [ "$target_date" != "$date_tag" ] && needs_fix=1
+  else
+    ALBUM_DATE_MAP["$album"]="$date_tag"
+  fi
+
+  if [ "$needs_fix" = "1" ]; then
+    local tmp="${file}.reconciletmp.m4a"
+    if ffmpeg -y -i "$file" -c copy -metadata album_artist="$target_artist" -metadata date="$target_date" "$tmp" -loglevel error; then
+      mv "$tmp" "$file"
+      echo "  Reconciled '$album' metadata for $(basename "$file") to match earlier track(s) from the same album"
+    else
+      echo "  Warning: failed to reconcile album metadata for $(basename "$file")" >&2
+      rm -f "$tmp"
+    fi
+  fi
+}
+
 # Looks up lyrics on lrclib.net (free, no API key) for one downloaded file,
 # using the title/artist/album tags already embedded on it, and writes a
 # sidecar .lrc file next to it with the same basename (e.g. Song_Artist.lrc
@@ -446,6 +514,15 @@ download_and_upload_batch() {
     echo "No .m4a files were downloaded for this batch."
     rm -rf "$batch_dir"
     return 1
+  fi
+
+  # Only needed in default/per-track mode — --album already guarantees
+  # every track in the batch shares identical album/album_artist/date by
+  # construction, so there's nothing to reconcile.
+  if [ -z "$ALBUM_MODE" ]; then
+    for f in "$batch_dir"/*.m4a; do
+      reconcile_album_metadata_for_file "$f"
+    done
   fi
 
   if [ -n "$FETCH_LYRICS" ]; then
