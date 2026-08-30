@@ -278,6 +278,7 @@ def fetch(url):
         return None
 
 lyrics = None
+is_synced = False
 
 print(f"  Looking up lyrics: title={title!r} artist={artist!r} album={album!r} duration={duration!r}")
 
@@ -289,8 +290,11 @@ if album:
 if duration:
     params["duration"] = str(duration)
 data = fetch("https://lrclib.net/api/get?" + urllib.parse.urlencode(params))
-if data and (data.get("syncedLyrics") or data.get("plainLyrics")):
-    lyrics = data.get("syncedLyrics") or data.get("plainLyrics")
+if data:
+    if data.get("syncedLyrics"):
+        lyrics, is_synced = data["syncedLyrics"], True
+    elif data.get("plainLyrics"):
+        lyrics, is_synced = data["plainLyrics"], False
 
 # Fuzzy fallback: helps when album is the constructed "Artist - Liked"
 # placeholder (no real album metadata) or duration is slightly off from
@@ -301,13 +305,41 @@ if not lyrics:
     print(f"  Fallback search returned {len(data) if isinstance(data, list) else 0} result(s)")
     if isinstance(data, list) and data:
         best = data[0]
-        lyrics = best.get("syncedLyrics") or best.get("plainLyrics")
+        if best.get("syncedLyrics"):
+            lyrics, is_synced = best["syncedLyrics"], True
+        elif best.get("plainLyrics"):
+            lyrics, is_synced = best["plainLyrics"], False
 
 if lyrics:
-    lrc_path = os.path.splitext(path)[0] + ".lrc"
-    with open(lrc_path, "w", encoding="utf-8") as f:
+    # Navidrome's own web player only reliably shows lyrics embedded
+    # directly in the file's tags — external .lrc/.txt sidecar files are
+    # a real, still-open limitation of its web UI (they mainly work in
+    # third-party Subsonic clients like Feishin/Symfonium, not the
+    # built-in player). So embed the lyrics into the file itself via an
+    # ffmpeg remux, and also drop the sidecar file for those third-party
+    # clients that do read it.
+    ext = ".lrc" if is_synced else ".txt"
+    lyrics_path = os.path.splitext(path)[0] + ext
+    with open(lyrics_path, "w", encoding="utf-8") as f:
         f.write(lyrics)
-    print(f"  Lyrics found for {os.path.basename(path)}")
+
+    tmp_path = path + ".lyricstmp.m4a"
+    embed = subprocess.run(
+        ["ffmpeg", "-y", "-i", path, "-c", "copy", "-metadata", f"lyrics={lyrics}", tmp_path],
+        capture_output=True, text=True, timeout=30
+    )
+    if embed.returncode == 0 and os.path.exists(tmp_path):
+        os.replace(tmp_path, path)
+        embedded = True
+    else:
+        embedded = False
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        print(f"  Warning: failed to embed lyrics into file tags: {embed.stderr.strip()[-300:]}")
+
+    kind = "synced" if is_synced else "plain (unsynced)"
+    where = "embedded + sidecar" if embedded else "sidecar only (embed failed)"
+    print(f"  Lyrics found for {os.path.basename(path)} ({kind}, {where}: {os.path.basename(lyrics_path)})")
 else:
     print(f"  No lyrics found for {os.path.basename(path)}")
 PYEOF
@@ -357,7 +389,7 @@ download_and_upload_batch() {
   # found for every track in this batch, instead of scp erroring on a
   # literal unmatched glob.
   shopt -s nullglob
-  local upload_files=("$batch_dir"/*.m4a "$batch_dir"/*.lrc)
+  local upload_files=("$batch_dir"/*.m4a "$batch_dir"/*.lrc "$batch_dir"/*.txt)
   shopt -u nullglob
   if scp -o ControlPath="$SSH_CONTROL_PATH" "${upload_files[@]}" "$REMOTE_SERVER:$FINAL_REMOTE_DIR/"; then
     rm -rf "$batch_dir"
@@ -402,8 +434,8 @@ fi
 if [ -n "$FETCH_LYRICS" ]; then
   echo ""
   echo "Note: for Navidrome to actually display these .lrc files, your"
-  echo "docker-compose.yml needs LyricsPriority set to include .lrc, e.g.:"
-  echo "  ND_LYRICSPRIORITY: .lrc,embedded"
+  echo "docker-compose.yml needs LyricsPriority set to include .lrc and .txt, e.g.:"
+  echo "  ND_LYRICSPRIORITY: .lrc,.txt,embedded"
   echo "(Navidrome only checks embedded tags by default.)"
 fi
 
