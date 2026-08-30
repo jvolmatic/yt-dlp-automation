@@ -104,9 +104,16 @@ if [ -n "$SINGLE_TRACK" ]; then
   # at all (rather than each getting its own differing upload year), so
   # they still all group together consistently, avoiding the original
   # per-year album-fragmentation bug.
+  #
+  # IMPORTANT: yt-dlp's embed-metadata postprocessor hardcodes the muxed
+  # "date" tag to always come from info_dict['upload_date']
+  # (ffmpeg.py: add('date', 'upload_date')) — it completely ignores a
+  # plain %(date)s field set via --parse-metadata. The only way to
+  # actually override the embedded tag is yt-dlp's "meta_<field>" escape
+  # hatch, which bypasses that hardcoded mapping. So this must target
+  # %(meta_date)s, not %(date)s — targeting %(date)s silently no-ops.
   DATE_ARGS=(
-    --parse-metadata '%(release_year|)s:%(date)s'
-    --parse-metadata '%(release_year|)s:%(year)s'
+    --parse-metadata '%(release_year|)s:%(meta_date)s'
   )
   # Safety net: some YouTube Music "share this song" links resolve to a bare
   # playlist/album URL with no video id, in which case --no-playlist has
@@ -125,9 +132,11 @@ else
   # album into several. playlist_uploader stays identical for every track
   # in the playlist/album, so grouping stays intact.
   ALBUM_ARTIST_PARSE="%(playlist_uploader,uploader,channel)s:%(album_artist)s"
+  # See the long comment above on meta_date — %(date)s alone is a no-op,
+  # since yt-dlp always embeds upload_date for that tag unless overridden
+  # via the meta_ prefix.
   DATE_ARGS=(
-    --parse-metadata '%(release_year,upload_date>%Y)s:%(date)s'
-    --parse-metadata '%(release_year,upload_date>%Y)s:%(year)s'
+    --parse-metadata '%(release_year,upload_date>%Y)s:%(meta_date)s'
   )
   SINGLE_ITEM_ARGS=()
 fi
@@ -246,15 +255,31 @@ if not title or not artist:
 
 def fetch(url):
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "music-dl-script/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "music-dl-script/1.0 (personal use)"})
         with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8")
             if resp.status != 200:
+                print(f"  lrclib HTTP {resp.status} for {url}")
                 return None
-            return json.loads(resp.read().decode("utf-8"))
-    except Exception:
+            return json.loads(body)
+    except urllib.error.HTTPError as e:
+        # lrclib returns 404 for "no match" on /api/get — expected/normal,
+        # not worth alarming about, but printed anyway for full visibility.
+        print(f"  lrclib HTTP {e.code} for {url}")
+        return None
+    except urllib.error.URLError as e:
+        print(f"  lrclib network error: {e.reason} for {url}")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"  lrclib returned unparseable JSON: {e}")
+        return None
+    except Exception as e:
+        print(f"  lrclib request failed: {type(e).__name__}: {e}")
         return None
 
 lyrics = None
+
+print(f"  Looking up lyrics: title={title!r} artist={artist!r} album={album!r} duration={duration!r}")
 
 # Exact match first: most reliable when title/artist/album/duration all
 # line up with lrclib's database.
@@ -273,6 +298,7 @@ if data and (data.get("syncedLyrics") or data.get("plainLyrics")):
 if not lyrics:
     params = {"track_name": title, "artist_name": artist}
     data = fetch("https://lrclib.net/api/search?" + urllib.parse.urlencode(params))
+    print(f"  Fallback search returned {len(data) if isinstance(data, list) else 0} result(s)")
     if isinstance(data, list) and data:
         best = data[0]
         lyrics = best.get("syncedLyrics") or best.get("plainLyrics")
