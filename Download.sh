@@ -198,7 +198,7 @@ def ffprobe_tag(tag):
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", f"format_tags={tag}",
-             "-of", "default=noprint_wrapper=1:nokey=1", path],
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True, timeout=10
         )
         if out.returncode != 0 and out.stderr.strip():
@@ -226,7 +226,7 @@ def ffprobe_duration():
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrapper=1:nokey=1", path],
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True, timeout=10
         )
         return int(float(out.stdout.strip()))
