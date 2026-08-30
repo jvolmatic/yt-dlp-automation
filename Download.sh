@@ -159,6 +159,21 @@ fi
 echo "Ensuring remote folder '$FINAL_REMOTE_DIR' exists..."
 ssh "${SSH_MUX_OPTS[@]}" "$REMOTE_SERVER" "mkdir -p '$FINAL_REMOTE_DIR'"
 
+# Sanity-check lyrics dependencies once, up front, instead of failing
+# silently per-track later.
+if [ -n "$FETCH_LYRICS" ]; then
+  if ! command -v ffprobe >/dev/null 2>&1; then
+    echo "Warning: ffprobe not found — lyrics lookup needs it to read back" >&2
+    echo "  title/artist tags. Install it (it ships with ffmpeg) or pass" >&2
+    echo "  --no-lyrics. Continuing without lyrics for this run." >&2
+    FETCH_LYRICS=""
+  elif ! command -v python3 >/dev/null 2>&1; then
+    echo "Warning: python3 not found — lyrics lookup needs it. Install it" >&2
+    echo "  or pass --no-lyrics. Continuing without lyrics for this run." >&2
+    FETCH_LYRICS=""
+  fi
+fi
+
 # Batch size for large playlists. Downloading + uploading in smaller chunks
 # keeps each yt-dlp run short (less time for YouTube cookies to rotate
 # mid-run) and means a failure only costs you one batch, not the whole
@@ -186,9 +201,26 @@ def ffprobe_tag(tag):
              "-of", "default=noprint_wrapper=1:nokey=1", path],
             capture_output=True, text=True, timeout=10
         )
+        if out.returncode != 0 and out.stderr.strip():
+            print(f"  ffprobe error reading '{tag}': {out.stderr.strip()}")
         return out.stdout.strip()
-    except Exception:
+    except FileNotFoundError:
+        print("  ffprobe not found on PATH")
         return ""
+    except Exception as e:
+        print(f"  ffprobe failed reading '{tag}': {e}")
+        return ""
+
+def ffprobe_all_tags():
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format_tags",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=10
+        )
+        return out.stdout.strip()
+    except Exception as e:
+        return f"(could not dump tags: {e})"
 
 def ffprobe_duration():
     try:
@@ -208,6 +240,8 @@ duration = ffprobe_duration()
 
 if not title or not artist:
     print(f"  Skipping lyrics for {os.path.basename(path)}: missing title/artist tag")
+    print(f"  Debug — title={title!r} artist={artist!r}")
+    print(f"  Debug — full tag dump: {ffprobe_all_tags()}")
     sys.exit(0)
 
 def fetch(url):
