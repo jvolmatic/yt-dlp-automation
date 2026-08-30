@@ -71,19 +71,36 @@ fi
 
 # Determine album tagging based on mode (Single/Liked track vs Full Album/Playlist)
 if [ -n "$SINGLE_TRACK" ]; then
-  ALBUM_PARSE="%(artist,uploader,channel)s - Liked:%(album)s"
-  # album_artist must be sourced the SAME way as the album name above
-  # (artist,uploader,channel), not playlist_uploader — a single Liked track
-  # has no playlist_uploader anyway, but keeping this explicit and matched
-  # to ALBUM_PARSE is what keeps grouping self-consistent for this mode.
-  ALBUM_ARTIST_PARSE="%(artist,uploader,channel)s:%(album_artist)s"
-  # Don't embed a per-track release year here. Navidrome's default album
-  # grouping (PID.Album) falls back to artist+album+releasedate when there's
-  # no MusicBrainz ID, so if every "Liked" track carries its own real upload
-  # year, tracks with the same "Artist - Liked" album name end up split into
-  # a separate album per year. Leaving date/year unset keeps it consistent
-  # (empty) across all Liked tracks so they group into one album.
-  DATE_ARGS=()
+  # Many official YouTube/YT Music uploads (e.g. "Artist - Topic" channels)
+  # already carry real album/album_artist/release_year metadata that yt-dlp
+  # extracts natively. Previous versions of this script unconditionally
+  # overwrote %(album)s with a constructed "Artist - Liked" name, clobbering
+  # that real metadata (e.g. showing "Kanye West - Liked" instead of the
+  # track's actual album "Graduation"). Now we prefer the real value and
+  # only fall back to the constructed name when the video truly has none
+  # (e.g. a remix/edit with no official album).
+  #
+  # Step 1: compute the fallback name into a custom field first, since
+  # --parse-metadata options apply in the order given, and step 2 needs
+  # this field to already exist.
+  LIKED_FALLBACK_ARGS=(--parse-metadata '%(artist,uploader,channel)s - Liked:%(meta_liked_fallback)s')
+  # Step 2: real album wins if present, else the fallback computed above.
+  ALBUM_PARSE='%(album,meta_liked_fallback)s:%(album)s'
+  # Same idea for album_artist: real value first, else per-track
+  # artist/uploader/channel (no playlist_uploader — a true single has no
+  # playlist context).
+  ALBUM_ARTIST_PARSE="%(album_artist,artist,uploader,channel)s:%(album_artist)s"
+  # Only embed a real release_year (present when real album metadata was
+  # found) — deliberately no upload_date fallback here. Tracks with a real
+  # album get their real, correct, consistent release date. Tracks that
+  # fell back to the constructed "Artist - Liked" pseudo-album get no date
+  # at all (rather than each getting its own differing upload year), so
+  # they still all group together consistently, avoiding the original
+  # per-year album-fragmentation bug.
+  DATE_ARGS=(
+    --parse-metadata '%(release_year|)s:%(date)s'
+    --parse-metadata '%(release_year|)s:%(year)s'
+  )
   # Safety net: some YouTube Music "share this song" links resolve to a bare
   # playlist/album URL with no video id, in which case --no-playlist has
   # nothing to cut down to and yt-dlp downloads the whole thing. Force a
@@ -92,6 +109,7 @@ if [ -n "$SINGLE_TRACK" ]; then
   SINGLE_ITEM_ARGS=(--playlist-items 1)
 else
   # Covers both full albums (-d "Albums/...") and playlists (-d "Playlists/...").
+  LIKED_FALLBACK_ARGS=()
   ALBUM_PARSE="%(playlist_title,title)s:%(album)s"
   # Source album_artist from the playlist's owning channel, not the
   # per-track artist field — per-track artist varies with features
@@ -158,6 +176,7 @@ download_and_upload_batch() {
     --embed-metadata \
     --embed-thumbnail \
     --parse-metadata '%(artist,uploader,channel)s:%(artist)s' \
+    "${LIKED_FALLBACK_ARGS[@]}" \
     --parse-metadata "$ALBUM_ARTIST_PARSE" \
     --parse-metadata "$ALBUM_PARSE" \
     --parse-metadata '%(track_number,playlist_index)s:%(track_number)s' \
