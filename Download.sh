@@ -4,6 +4,7 @@
 SINGLE_TRACK=""
 SUBDIR=""
 FETCH_LYRICS="1"
+BATCH_SIZE_ARG=""
 POSITIONAL_ARGS=()
 
 while [ $# -gt 0 ]; do
@@ -20,6 +21,10 @@ while [ $# -gt 0 ]; do
       FETCH_LYRICS=""
       shift
       ;;
+    --batch)
+      BATCH_SIZE_ARG="$2"
+      shift 2
+      ;;
     *)
       POSITIONAL_ARGS+=("$1")
       shift
@@ -32,13 +37,15 @@ set -- "${POSITIONAL_ARGS[@]}"
 
 # Check if a URL was provided
 if [ -z "$1" ]; then
-  echo "Usage: $0 [--single|-s] [-d <subfolder>] [--no-lyrics] <YouTube URL> [browser]"
+  echo "Usage: $0 [--single|-s] [-d <subfolder>] [--no-lyrics] [--batch <N>] <YouTube URL> [browser]"
   echo ""
   echo "Lyrics are fetched from lrclib.net by default. Pass --no-lyrics to skip."
+  echo "Playlists/albums download in batches of 50 by default. Pass --batch <N> to change."
   echo ""
   echo "Examples:"
   echo "  $0 'https://music.youtube.com/playlist?list=...' -d 'Albums/Kanye/BULLY'"
   echo "  $0 -s 'https://music.youtube.com/watch?v=...' -d 'Liked' --no-lyrics"
+  echo "  $0 'https://music.youtube.com/playlist?list=...' -d 'Playlists/RnB' --batch 20"
   exit 1
 fi
 
@@ -188,6 +195,13 @@ fi
 # mid-run) and means a failure only costs you one batch, not the whole
 # playlist — already-uploaded batches are safe either way.
 BATCH_SIZE=50
+if [ -n "$BATCH_SIZE_ARG" ]; then
+  if ! [[ "$BATCH_SIZE_ARG" =~ ^[0-9]+$ ]] || [ "$BATCH_SIZE_ARG" -le 0 ]; then
+    echo "Error: --batch must be a positive integer, got '$BATCH_SIZE_ARG'." >&2
+    exit 1
+  fi
+  BATCH_SIZE="$BATCH_SIZE_ARG"
+fi
 
 # Looks up lyrics on lrclib.net (free, no API key) for one downloaded file,
 # using the title/artist/album tags already embedded on it, and writes a
