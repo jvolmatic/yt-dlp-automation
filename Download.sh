@@ -83,6 +83,24 @@ else
   FINAL_REMOTE_DIR="$BASE_REMOTE_DIR"
 fi
 
+# --- Cookie source ---
+# YouTube rotates certain account cookies whenever the browser itself touches
+# youtube.com. On a long playlist, --cookies-from-browser can go stale
+# mid-download if Firefox touches YouTube while yt-dlp is still running,
+# producing "cookies are no longer valid" errors partway through.
+# Prefer a frozen cookies.txt exported once from a private/incognito window
+# (see https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies)
+# if one exists; otherwise fall back to live browser extraction as before.
+COOKIES_FILE="$HOME/.config/music-dl/youtube-cookies.txt"
+if [ -f "$COOKIES_FILE" ]; then
+  COOKIE_ARGS=(--cookies "$COOKIES_FILE")
+  echo "Using cookies from $COOKIES_FILE..."
+else
+  COOKIE_ARGS=(--cookies-from-browser "$BROWSER")
+  echo "Using cookies from $BROWSER..."
+  echo "Tip: for large playlists, export a frozen cookies.txt to $COOKIES_FILE to avoid mid-download cookie rotation errors."
+fi
+
 # Determine album tagging based on mode (Single/Liked track vs Full Album/Playlist)
 if [ -n "$SINGLE_TRACK" ]; then
   # Many official YouTube/YT Music uploads (e.g. "Artist - Topic" channels)
@@ -139,11 +157,28 @@ else
   # album into several. playlist_uploader stays identical for every track
   # in the playlist/album, so grouping stays intact.
   ALBUM_ARTIST_PARSE="%(playlist_uploader,uploader,channel)s:%(album_artist)s"
+  # Same fragmentation problem we already fixed for album_artist can also
+  # hit the date: if some tracks in a real album/playlist carry a
+  # different release_year (or fall back to a different upload_date) than
+  # others — e.g. bonus/deluxe tracks re-uploaded at a different time —
+  # each per-track date value fractures Navidrome's grouping even though
+  # the album name text is identical. Fix: probe ONE reference track
+  # (the first item) for its year, then force that exact same literal
+  # value onto every track in every batch, instead of letting each
+  # track's own metadata decide independently.
+  echo "Determining a consistent release year for this album/playlist..."
+  ALBUM_YEAR=$(yt-dlp "${COOKIE_ARGS[@]}" --playlist-items 1 --print '%(release_year,upload_date>%Y)s' "$URL" 2>/dev/null | head -n1)
+  if ! [[ "$ALBUM_YEAR" =~ ^[0-9]{4}$ ]]; then
+    echo "Could not determine a release year — tracks will be embedded without one."
+    ALBUM_YEAR=""
+  fi
   # See the long comment above on meta_date — %(date)s alone is a no-op,
   # since yt-dlp always embeds upload_date for that tag unless overridden
-  # via the meta_ prefix.
+  # via the meta_ prefix. The FROM side here is a literal (not a
+  # per-track field reference), which is what makes it identical across
+  # every track regardless of that track's own metadata.
   DATE_ARGS=(
-    --parse-metadata '%(release_year,upload_date>%Y)s:%(meta_date)s'
+    --parse-metadata "${ALBUM_YEAR}:%(meta_date)s"
   )
   SINGLE_ITEM_ARGS=()
 fi
@@ -152,24 +187,6 @@ fi
 # Navidrome reads track order/album/artist from the embedded ID3 tags above,
 # not from the filename, so this is safe everywhere.
 OUTPUT_TEMPLATE="%(title)s_%(artist)s.%(ext)s"
-
-# --- Cookie source ---
-# YouTube rotates certain account cookies whenever the browser itself touches
-# youtube.com. On a long playlist, --cookies-from-browser can go stale
-# mid-download if Firefox touches YouTube while yt-dlp is still running,
-# producing "cookies are no longer valid" errors partway through.
-# Prefer a frozen cookies.txt exported once from a private/incognito window
-# (see https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies)
-# if one exists; otherwise fall back to live browser extraction as before.
-COOKIES_FILE="$HOME/.config/music-dl/youtube-cookies.txt"
-if [ -f "$COOKIES_FILE" ]; then
-  COOKIE_ARGS=(--cookies "$COOKIES_FILE")
-  echo "Using cookies from $COOKIES_FILE..."
-else
-  COOKIE_ARGS=(--cookies-from-browser "$BROWSER")
-  echo "Using cookies from $BROWSER..."
-  echo "Tip: for large playlists, export a frozen cookies.txt to $COOKIES_FILE to avoid mid-download cookie rotation errors."
-fi
 
 # Make sure the remote destination exists once, up front.
 echo "Ensuring remote folder '$FINAL_REMOTE_DIR' exists..."
