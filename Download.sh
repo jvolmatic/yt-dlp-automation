@@ -123,8 +123,63 @@ else
   echo "Tip: for large playlists, export a frozen cookies.txt to $COOKIES_FILE to avoid mid-download cookie rotation errors."
 fi
 
+# --- Persistent album metadata cache ---
+# The per-run reconciliation/probing tricks below only guarantee
+# consistency WITHIN a single script execution. If the same real album
+# is downloaded again in a later, separate run (or from a different
+# playlist/album link pointing at the same music), there's no memory of
+# what was chosen last time, so a fresh mismatch is possible even though
+# the album name text matches exactly. This small local JSON cache
+# (album name -> {album_artist, date}) fixes that: the first time an
+# album is seen, its chosen values are saved here; every later run reads
+# this file first and reuses those exact same values instead of
+# re-deciding independently.
+ALBUM_CACHE_FILE="$HOME/.config/music-dl/album_metadata_cache.json"
+mkdir -p "$(dirname "$ALBUM_CACHE_FILE")"
+
+# Prints "album_artist\ndate" (two lines) and exits 0 if a cached entry
+# exists for this album name; exits 1 with no output otherwise.
+album_cache_get() {
+  local key="$1"
+  python3 - "$ALBUM_CACHE_FILE" "$key" << 'PYEOF'
+import sys, json, os
+cache_file, key = sys.argv[1], sys.argv[2]
+if not os.path.exists(cache_file):
+    sys.exit(1)
+try:
+    with open(cache_file) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+entry = data.get(key)
+if not entry:
+    sys.exit(1)
+print(entry.get("album_artist", ""))
+print(entry.get("date", ""))
+PYEOF
+}
+
+# Saves/updates the canonical album_artist/date for an album name.
+album_cache_set() {
+  local key="$1" artist="$2" date_val="$3"
+  python3 - "$ALBUM_CACHE_FILE" "$key" "$artist" "$date_val" << 'PYEOF'
+import sys, json, os
+cache_file, key, artist, date_val = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+data = {}
+if os.path.exists(cache_file):
+    try:
+        with open(cache_file) as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+data[key] = {"album_artist": artist, "date": date_val}
+with open(cache_file, "w") as f:
+    json.dump(data, f, indent=2)
+PYEOF
+}
+
 # Determine album tagging based on mode:
-#  - --single (SINGLE_TRACK) or --liked (LIKED_MODE): tag each track with
+#  - --single (SINGLE_TRACK) or plain default: tag each track with
 #    ITS OWN real album/artist/date, falling back to a constructed
 #    "Artist - Liked" pseudo-album only when a track truly has none.
 #    --single additionally restricts the download to exactly one item;
@@ -139,43 +194,69 @@ if [ -n "$ALBUM_MODE" ]; then
   # Covers full albums (-d "Albums/...") and curated playlists
   # (-d "Playlists/...") where the whole download really is one thing.
   LIKED_FALLBACK_ARGS=()
-  ALBUM_PARSE="%(playlist_title,title)s:%(album)s"
+  REPLACE_ARGS=()
+
+  # Resolve the final album name FIRST (before deciding artist/date), so
+  # we can check the cache before doing anything else.
+  RAW_PLAYLIST_TITLE=$(yt-dlp "${COOKIE_ARGS[@]}" --flat-playlist --playlist-items 1 --print '%(playlist_title,title)s' "$URL" 2>/dev/null | head -n1)
   # YouTube Music auto-generates playlist titles like "Album - BULLY -
   # DELUXE" for whole-album playlists — that "Album - " prefix is literal
   # text in the source playlist's own title, not something this script
-  # adds. Strip it so the embedded album name matches how a normal album
-  # (e.g. "Graduation", "Voodoo") looks, instead of "Album - Voodoo".
-  # --replace-in-metadata runs in the same ordered pipeline as
-  # --parse-metadata, so placing it after ALBUM_PARSE in the yt-dlp
-  # invocation below means it operates on the album value we just set.
-  REPLACE_ARGS=(--replace-in-metadata "album" "(?i)^album\s*-\s*" "")
-  # Source album_artist from the playlist's owning channel, not the
-  # per-track artist field — per-track artist varies with features
-  # (e.g. "Kanye West, Ye" vs "Kanye West, Ye, Travis Scott"), and since
-  # Navidrome groups albums by album_artist, letting it vary fractures one
-  # album into several. playlist_uploader stays identical for every track
-  # in the playlist/album, so grouping stays intact.
-  ALBUM_ARTIST_PARSE="%(playlist_uploader,uploader,channel)s:%(album_artist)s"
-  # Same fragmentation problem we already fixed for album_artist can also
-  # hit the date: if some tracks in a real album/playlist carry a
-  # different release_year (or fall back to a different upload_date) than
-  # others — e.g. bonus/deluxe tracks re-uploaded at a different time —
-  # each per-track date value fractures Navidrome's grouping even though
-  # the album name text is identical. Fix: probe ONE reference track
-  # (the first item) for its year, then force that exact same literal
-  # value onto every track in every batch, instead of letting each
-  # track's own metadata decide independently.
-  echo "Determining a consistent release year for this album/playlist..."
-  ALBUM_YEAR=$(yt-dlp "${COOKIE_ARGS[@]}" --playlist-items 1 --print '%(release_year,upload_date>%Y)s' "$URL" 2>/dev/null | head -n1)
-  if ! [[ "$ALBUM_YEAR" =~ ^[0-9]{4}$ ]]; then
-    echo "Could not determine a release year — tracks will be embedded without one."
-    ALBUM_YEAR=""
+  # adds. Strip it here (in bash) so the cache key and the embedded album
+  # name both match how a normal album (e.g. "Graduation", "Voodoo")
+  # looks, instead of "Album - Voodoo".
+  FINAL_ALBUM_NAME=$(echo "$RAW_PLAYLIST_TITLE" | sed -E 's/^[Aa][Ll][Bb][Uu][Mm][[:space:]]*-[[:space:]]*//')
+  # yt-dlp's --parse-metadata splits "FROM:TO" on the first unescaped
+  # colon, so an album name that itself contains a colon (e.g. "Late
+  # Registration: Deluxe") must have it escaped or the split breaks.
+  ALBUM_PARSE="${FINAL_ALBUM_NAME//:/\\:}:%(album)s"
+
+  echo "Checking cache for existing metadata for '$FINAL_ALBUM_NAME'..."
+  CACHE_HIT=""
+  if CACHE_RESULT=$(album_cache_get "$FINAL_ALBUM_NAME"); then
+    ALBUM_ARTIST_VALUE=$(echo "$CACHE_RESULT" | sed -n '1p')
+    ALBUM_YEAR=$(echo "$CACHE_RESULT" | sed -n '2p')
+    CACHE_HIT="1"
+    echo "Found cached metadata — reusing album_artist='$ALBUM_ARTIST_VALUE' date='$ALBUM_YEAR' from a previous run."
+  else
+    echo "No cached metadata — probing this album for the first time."
+    # Source album_artist from the playlist's owning channel, not the
+    # per-track artist field — per-track artist varies with features
+    # (e.g. "Kanye West, Ye" vs "Kanye West, Ye, Travis Scott"), and since
+    # Navidrome groups albums by album_artist, letting it vary fractures
+    # one album into several. playlist_uploader stays identical for every
+    # track in the playlist/album, so grouping stays intact within a run.
+    RAW_ALBUM_ARTIST=$(yt-dlp "${COOKIE_ARGS[@]}" --playlist-items 1 --print '%(playlist_uploader,uploader,channel)s' "$URL" 2>/dev/null | head -n1)
+    # Official YouTube "Artist - Topic" auto-generated channels are named
+    # literally that — with a " - Topic" suffix — which otherwise leaks
+    # straight into album_artist (e.g. showing as "DONDA - Topic" instead
+    # of "Kanye West"). Strip it.
+    ALBUM_ARTIST_VALUE=$(echo "$RAW_ALBUM_ARTIST" | sed -E 's/[[:space:]]*-[[:space:]]*Topic$//I')
+    # Same fragmentation problem we already fixed for album_artist can
+    # also hit the date: if some tracks in a real album/playlist carry a
+    # different release_year (or fall back to a different upload_date)
+    # than others — e.g. bonus/deluxe tracks re-uploaded at a different
+    # time — each per-track date value fractures Navidrome's grouping
+    # even though the album name text is identical. Fix: probe ONE
+    # reference track (the first item) for its year.
+    ALBUM_YEAR=$(yt-dlp "${COOKIE_ARGS[@]}" --playlist-items 1 --print '%(release_year,upload_date>%Y)s' "$URL" 2>/dev/null | head -n1)
+    if ! [[ "$ALBUM_YEAR" =~ ^[0-9]{4}$ ]]; then
+      echo "Could not determine a release year — tracks will be embedded without one."
+      ALBUM_YEAR=""
+    fi
+    album_cache_set "$FINAL_ALBUM_NAME" "$ALBUM_ARTIST_VALUE" "$ALBUM_YEAR"
+    echo "Saved album_artist='$ALBUM_ARTIST_VALUE' date='$ALBUM_YEAR' for '$FINAL_ALBUM_NAME' for future runs."
   fi
+
+  # Both of these are now resolved, concrete literal strings (not
+  # per-track field templates) — either freshly probed or loaded from the
+  # cache — so every track in every batch, in this run or any future run
+  # downloading more of this same album, gets the exact same value.
+  # Same colon-escaping reason as ALBUM_PARSE above.
+  ALBUM_ARTIST_PARSE="${ALBUM_ARTIST_VALUE//:/\\:}:%(album_artist)s"
   # See the long comment below on meta_date — %(date)s alone is a no-op,
   # since yt-dlp always embeds upload_date for that tag unless overridden
-  # via the meta_ prefix. The FROM side here is a literal (not a
-  # per-track field reference), which is what makes it identical across
-  # every track regardless of that track's own metadata.
+  # via the meta_ prefix.
   DATE_ARGS=(
     --parse-metadata "${ALBUM_YEAR}:%(meta_date)s"
   )
