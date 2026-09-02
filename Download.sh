@@ -45,7 +45,7 @@ done
 # Restore positional arguments
 set -- "${POSITIONAL_ARGS[@]}"
 
-# Error check: -f provided without --album flag[cite: 1]
+# Error check: -f provided without --album flag
 if [ -n "$FILE_PATH" ] && [ -z "$ALBUM_MODE" ]; then
   echo "Error: The -f flag requires the --album flag to be set." >&2
   echo "Proper usage: $0 --album -f \"file.txt\" [-d <subfolder>] [--no-lyrics]" >&2
@@ -55,14 +55,6 @@ fi
 # Check if a URL was provided (unless -f is used with --album)
 if [ -z "$1" ] && [ -z "$FILE_PATH" ]; then
   echo "Usage: $0 [--single|-s] [--album [-f <file.txt>]] [-d <subfolder>] [--no-lyrics] [--batch <N>] <YouTube URL> [browser]"
-  echo ""
-  echo "Default (no flag): tags each track with ITS OWN real album/artist/date"
-  echo "--album: treat the ENTIRE download as one album, named after the playlist/album title."
-  echo "  Can be combined with -f <file.txt> to batch-download multiple albums from a file."
-  echo ""
-  echo "Examples:"
-  echo "  $0 --album -f 'albums.txt'"
-  echo "  $0 --album 'https://music.youtube.com/playlist?list=...' -d 'Albums/Kanye/BULLY'"
   exit 1
 fi
 
@@ -114,7 +106,7 @@ try:
 except Exception:
     sys.exit(1)
 entry = data.get(key)
-if not entry:
+if not entry or key == "NA":
     sys.exit(1)
 print(entry.get("album_artist", ""))
 print(entry.get("date", ""))
@@ -126,6 +118,8 @@ album_cache_set() {
   python3 - "$ALBUM_CACHE_FILE" "$key" "$artist" "$date_val" << 'PYEOF'
 import sys, json, os
 cache_file, key, artist, date_val = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+if key == "NA" or not key.strip():
+    sys.exit(0)
 data = {}
 if os.path.exists(cache_file):
     try:
@@ -143,9 +137,15 @@ PYEOF
 process_album_target() {
   local target_url="$1"
   local target_subdir="$2"
+  local clean_sub FINAL_REMOTE_DIR
+  local LIKED_FALLBACK_ARGS REPLACE_ARGS
+  local RAW_PLAYLIST_TITLE FINAL_ALBUM_NAME ALBUM_PARSE
+  local CACHE_RESULT ALBUM_ARTIST_VALUE ALBUM_YEAR RAW_ALBUM_ARTIST
+  local ALBUM_ARTIST_PARSE DATE_ARGS SINGLE_ITEM_ARGS
+  local FALLBACK_ALBUM_NAME OUTPUT_TEMPLATE TOTAL_ITEMS START BATCH_NUM END
 
   if [ -n "$target_subdir" ]; then
-    local clean_sub=$(echo "$target_subdir" | sed 's|^/||;s|/$||')
+    clean_sub=$(echo "$target_subdir" | sed 's|^/||;s|/$||')
     FINAL_REMOTE_DIR="$BASE_REMOTE_DIR/$clean_sub"
   else
     FINAL_REMOTE_DIR="$BASE_REMOTE_DIR"
@@ -158,29 +158,40 @@ process_album_target() {
     LIKED_FALLBACK_ARGS=()
     REPLACE_ARGS=()
 
-    RAW_PLAYLIST_TITLE=$(yt-dlp "${COOKIE_ARGS[@]}" --flat-playlist --playlist-items 1 --print '%(playlist_title,title)s' "$target_url" 2>/dev/null | head -n1)
-    FINAL_ALBUM_NAME=$(echo "$RAW_PLAYLIST_TITLE" | sed -E 's/^[Aa][Ll][Bb][Uu][Mm][[:space:]]*-[[:space:]]*//')
-    ALBUM_PARSE="${FINAL_ALBUM_NAME//:/\\:}:%(album)s"
+    RAW_PLAYLIST_TITLE=$(yt-dlp "${COOKIE_ARGS[@]}" --flat-playlist --playlist-items 1 --print '%(playlist_title,title|)s' "$target_url" 2>/dev/null | head -n1)
 
-    echo "Checking cache for existing metadata for '$FINAL_ALBUM_NAME'..."
+    if [ -z "$RAW_PLAYLIST_TITLE" ] || [[ "$RAW_PLAYLIST_TITLE" == *"NA"* ]]; then
+      RAW_PLAYLIST_TITLE=$(basename "$target_subdir")
+    fi
+
+    FINAL_ALBUM_NAME=$(echo "$RAW_PLAYLIST_TITLE" | sed -E 's/^[Aa][Ll][Bb][Uu][Mm][[:space:]]*-[[:space:]]*//')
+
+    # Appending %(autowrap_bypass|)s to prevent yt-dlp from turning single-word literals into variable requests
+    ALBUM_PARSE="${FINAL_ALBUM_NAME//:/\\:}%(autowrap_bypass|)s:%(album)s"
+
+    echo "Checking cache for metadata for '$FINAL_ALBUM_NAME'..."
     if CACHE_RESULT=$(album_cache_get "$FINAL_ALBUM_NAME"); then
       ALBUM_ARTIST_VALUE=$(echo "$CACHE_RESULT" | sed -n '1p')
       ALBUM_YEAR=$(echo "$CACHE_RESULT" | sed -n '2p')
       echo "Found cached metadata — reusing album_artist='$ALBUM_ARTIST_VALUE' date='$ALBUM_YEAR'."
     else
       echo "No cached metadata — probing this album for the first time."
-      RAW_ALBUM_ARTIST=$(yt-dlp "${COOKIE_ARGS[@]}" --playlist-items 1 --print '%(playlist_uploader,uploader,channel)s' "$target_url" 2>/dev/null | head -n1)
+      RAW_ALBUM_ARTIST=$(yt-dlp "${COOKIE_ARGS[@]}" --playlist-items 1 --print '%(playlist_uploader,uploader,channel|)s' "$target_url" 2>/dev/null | head -n1)
+      if [ -z "$RAW_ALBUM_ARTIST" ] || [[ "$RAW_ALBUM_ARTIST" == *"NA"* ]]; then
+        RAW_ALBUM_ARTIST=$(echo "$target_subdir" | awk -F'/' '{print $(NF-1)}')
+      fi
       ALBUM_ARTIST_VALUE=$(echo "$RAW_ALBUM_ARTIST" | sed -E 's/[[:space:]]*-[[:space:]]*Topic$//I')
-      ALBUM_YEAR=$(yt-dlp "${COOKIE_ARGS[@]}" --playlist-items 1 --print '%(release_year,upload_date>%Y)s' "$target_url" 2>/dev/null | head -n1)
+
+      ALBUM_YEAR=$(yt-dlp "${COOKIE_ARGS[@]}" --playlist-items 1 --print '%(release_year,upload_date>%Y|)s' "$target_url" 2>/dev/null | head -n1)
       if ! [[ "$ALBUM_YEAR" =~ ^[0-9]{4}$ ]]; then
         ALBUM_YEAR=""
       fi
       album_cache_set "$FINAL_ALBUM_NAME" "$ALBUM_ARTIST_VALUE" "$ALBUM_YEAR"
     fi
 
-    ALBUM_ARTIST_PARSE="${ALBUM_ARTIST_VALUE//:/\\:}:%(album_artist)s"
+    ALBUM_ARTIST_PARSE="${ALBUM_ARTIST_VALUE//:/\\:}%(autowrap_bypass|)s:%(album_artist)s"
     DATE_ARGS=(
-      --parse-metadata "${ALBUM_YEAR}:%(meta_date)s"
+      --parse-metadata "${ALBUM_YEAR}%(autowrap_bypass|)s:%(meta_date)s"
     )
     SINGLE_ITEM_ARGS=()
   else
@@ -190,12 +201,12 @@ process_album_target() {
       FALLBACK_ALBUM_NAME="Liked"
     fi
     LIKED_FALLBACK_ARGS=(
-      --parse-metadata "${FALLBACK_ALBUM_NAME//:/\\:}:%(meta_liked_fallback)s"
-      --parse-metadata "Various Artists:%(meta_liked_fallback_artist)s"
+      --parse-metadata "${FALLBACK_ALBUM_NAME//:/\\:}%(autowrap_bypass|)s:%(meta_liked_fallback)s"
+      --parse-metadata "Various Artists%(autowrap_bypass|)s:%(meta_liked_fallback_artist)s"
     )
     REPLACE_ARGS=()
-    ALBUM_PARSE='%(album,meta_liked_fallback)s:%(album)s'
-    ALBUM_ARTIST_PARSE='%(album_artist,meta_liked_fallback_artist)s:%(album_artist)s'
+    ALBUM_PARSE='%(album,meta_liked_fallback|)s:%(album)s'
+    ALBUM_ARTIST_PARSE='%(album_artist,meta_liked_fallback_artist|)s:%(album_artist)s'
     DATE_ARGS=(
       --parse-metadata '%(release_year|)s:%(meta_date)s'
     )
@@ -336,12 +347,13 @@ download_and_upload_batch() {
     "${COOKIE_ARGS[@]}" \
     --embed-metadata \
     --embed-thumbnail \
-    --parse-metadata '%(artist,uploader,channel)s:%(artist)s' \
+    --parse-metadata '%(artist,uploader,channel|)s:%(artist)s' \
+    --replace-in-metadata artist ',\s*' '; ' \
     "${LIKED_FALLBACK_ARGS[@]}" \
     --parse-metadata "$ALBUM_ARTIST_PARSE" \
     --parse-metadata "$ALBUM_PARSE" \
     "${REPLACE_ARGS[@]}" \
-    --parse-metadata '%(track_number,playlist_index)s:%(track_number)s' \
+    --parse-metadata '%(track_number,playlist_index|)s:%(track_number)s' \
     "${DATE_ARGS[@]}" \
     -o "$batch_dir/$OUTPUT_TEMPLATE" \
     "$batch_url" </dev/null
@@ -377,7 +389,6 @@ if [ -n "$BATCH_SIZE_ARG" ]; then
   BATCH_SIZE="$BATCH_SIZE_ARG"
 fi
 
-# Main Execution Flow using a dedicated file descriptor (3) to prevent stdin consumption
 if [ -n "$FILE_PATH" ]; then
   if [ ! -f "$FILE_PATH" ]; then
     echo "Error: File '$FILE_PATH' not found." >&2
